@@ -1,807 +1,857 @@
-#include <WiFiManager.h>
-#include <ESPmDNS.h>
-#include <Wire.h>
-#include <DHT.h>
-#include <Preferences.h>
-#include <PubSubClient.h>
+#include <WiFi.h>
 #include <WebServer.h>
+#include <SPIFFS.h>
+#include <DHT.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
-// Definições de pins
+// Definições de pinos
 #define DHTPIN 13
-#define NUM_SOIL_SENSORS 2
-#define SOIL_SENSOR1 12
-#define SOIL_SENSOR2 14
-#define RELAY_PIN 15
-#define BTN_MODE 27
+#define SOLO_PIN1 12
+#define SOLO_PIN2 14
+#define RELE_PIN 15
+#define BOTAO_PIN 27
+#define LED_REDE_PIN 25
+#define LED_RELE_PIN 33
 
 // Constantes
-#define MQTT_RETRY_INTERVAL 30000         // 30 segundos entre tentativas de reconexão
-#define DURACAO_MAXIMA_IRRIGACAO 1200000  // 20 minutos em millisegundos
+#define DHTTYPE DHT11
+#define TEMPO_IRRIGACAO 900000 // 15 minutos em milissegundos
+#define SOLO_MAXIMO 100
+#define SOLO_MINIMO 0
+#define LEITURA_SOLO_MAX 4095  // Valor máximo da leitura analógica (seco)
+#define LEITURA_SOLO_MIN 1000  // Valor mínimo da leitura analógica (úmido)
 
+// Variáveis globais
+bool modoAutomatico = true;
+bool releAtivo = false;
+bool botaoApertado = false;
+unsigned long tempoInicioIrrigacao = 0;
+int horaInicio = 6;  // Hora padrão (6:00)
+int minutoInicio = 0;
 
-// Substitua a função getESPTemp() por esta versão atualizada:
-#ifdef __cplusplus
-extern "C" {
-#endif
-  uint8_t temprature_sens_read();
-#ifdef __cplusplus
-}
-#endif
-
-float getESPTemp() {
-#ifdef CONFIG_IDF_TARGET_ESP32
-  // Para ESP32 original
-  return (float)(140 - ((255 - temprature_sens_read()) * 165)) / 255;
-#else
-  // Para outros modelos de ESP32 (S2, S3, C3)
-  return 0;  // Estes modelos não têm sensor de temperatura interno
-#endif
-}
-
-// Objetos globais
-WiFiManager wm;
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+// Objetos
+DHT dht(DHTPIN, DHTTYPE);
 WebServer server(80);
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", -10800, 60000);
-DHT dht(DHTPIN, DHT11);
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600); // Fortaleza GMT-3
 Preferences preferences;
 
-// Estruturas de dados
-struct Config {
-  char mqtt_server[40] = "";
-  char mqtt_port[6] = "1883";
-  char mqtt_user[40] = "";
-  char mqtt_password[40] = "";
-  int horaInicio = 5;
-  int minutoInicio = 0;
-  bool modoAutomatico = true;
-} config;
+// Configurações de Wi-Fi - SUBSTITUA COM SUAS INFORMAÇÕES
 
-struct SystemState {
-  float temperatura = 0;
-  float umidade = 0;
-  float umidadeSolo = 0;
-  bool relayStatus = false;
-  unsigned long tempoIrrigacaoInicio = 0;
-  unsigned long lastMqttRetry = 0;
-} state;
+const char* ssid = "VIVOFIBRA-6969-EXT";
+const char* password = "Kx8mrWQByh";
 
-// HTML da interface web
-const char* htmlPage = R"rawliteral(
-<!DOCTYPE HTML>
-<html>
-<head>
-    <title>Sistema de Irrigação</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { 
-            font-family: Arial, sans-serif; 
-            margin: 20px;
-            background-color: #f0f2f5;
-        }
-        .container { 
-            max-width: 1000px; 
-            margin: auto;
-            background-color: white;
-            padding: 20px;
-            border-radius: 12px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        .tab { 
-            overflow: hidden; 
-            border: none;
-            background-color: #f8f9fa;
-            border-radius: 8px;
-            margin-bottom: 20px;
-        }
-        .tab button { 
-            background-color: transparent; 
-            float: left; 
-            border: none; 
-            padding: 14px 24px;
-            cursor: pointer;
-            font-size: 16px;
-            border-radius: 8px;
-            margin: 5px;
-            transition: all 0.3s ease;
-        }
-        .tab button:hover { 
-            background-color: #e9ecef;
-        }
-        .tab button.active { 
-            background-color: #2196F3;
-            color: white;
-        }
-        .tabcontent { 
-            display: none; 
-            padding: 20px;
-            animation: fadeIn 0.5s;
-        }
-        @keyframes fadeIn {
-            from {opacity: 0;}
-            to {opacity: 1;}
-        }
-        .grid { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        .card {
-            background-color: #f8f9fa;
-            padding: 20px;
-            border-radius: 12px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        }
-        .card h3 {
-            margin: 0 0 15px 0;
-            color: #333;
-        }
-        .card p {
-            font-size: 1.2em;
-            color: #2196F3;
-            margin: 10px 0;
-        }
-        .config-section {
-            background-color: #f8f9fa;
-            padding: 20px;
-            border-radius: 12px;
-            margin-bottom: 20px;
-        }
-        .config-section h3 {
-            margin: 0 0 15px 0;
-            color: #333;
-        }
-        .form-group { 
-            margin-bottom: 15px; 
-        }
-        label { 
-            display: block; 
-            margin-bottom: 8px;
-            color: #555;
-        }
-        input[type="text"], 
-        input[type="password"],
-        input[type="number"] { 
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            font-size: 14px;
-        }
-        input:focus {
-            outline: none;
-            border-color: #2196F3;
-            box-shadow: 0 0 0 2px rgba(33,150,243,0.1);
-        }
-        button { 
-            padding: 12px 24px;
-            background-color: #2196F3;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 16px;
-            transition: background-color 0.3s;
-        }
-        button:hover { 
-            background-color: #1976D2;
-        }
-        .switch {
-            position: relative;
-            display: inline-block;
-            width: 60px;
-            height: 34px;
-            margin: 10px 0;
-        }
-        .switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-        .slider {
-            position: absolute;
-            cursor: pointer;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background-color: #ccc;
-            transition: .4s;
-            border-radius: 34px;
-        }
-        .slider:before {
-            position: absolute;
-            content: "";
-            height: 26px;
-            width: 26px;
-            left: 4px;
-            bottom: 4px;
-            background-color: white;
-            transition: .4s;
-            border-radius: 50%;
-        }
-        input:checked + .slider {
-            background-color: #2196F3;
-        }
-        input:checked + .slider:before {
-            transform: translateX(26px);
-        }
-        .value-display {
-            font-size: 24px;
-            font-weight: bold;
-            color: #2196F3;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="tab">
-            <button class="tablinks" onclick="openTab(event, 'Monitor')" id="defaultOpen">Monitor</button>
-            <button class="tablinks" onclick="openTab(event, 'Config')">Configurações</button>
-            <button class="tablinks" onclick="openTab(event, 'Info')">Info</button>
-        </div>
+// Estados do LED
+enum LEDState {
+  LED_OK,
+  LED_ERRO_WIFI,
+  LED_ERRO_SENSOR,
+  LED_CONFIGURANDO
+};
 
-        <div id="Monitor" class="tabcontent">
-            <div class="grid">
-                <div class="card">
-                    <h3>Temperatura</h3>
-                    <div id="temperatura" class="value-display">--°C</div>
-                </div>
-                <div class="card">
-                    <h3>Umidade Ar</h3>
-                    <div id="umidade" class="value-display">--%</div>
-                </div>
-                <div class="card">
-                    <h3>Umidade Solo</h3>
-                    <div id="umidadeSolo" class="value-display">--%</div>
-                </div>
-                <div class="card">
-                    <h3>Controles</h3>
-                    <p>
-                        Modo Automático:
-                        <label class="switch">
-                            <input type="checkbox" id="modoAutomatico" onchange="toggleModo()">
-                            <span class="slider"></span>
-                        </label>
-                    </p>
-                    <p>
-                        Relé:
-                        <label class="switch">
-                            <input type="checkbox" id="releStatus" onchange="toggleRele()">
-                            <span class="slider"></span>
-                        </label>
-                    </p>
-                </div>
-            </div>
-        </div>
+LEDState estadoLedRede = LED_CONFIGURANDO;
 
-          <div id="Config" class="tabcontent">
-            <form id="configForm" onsubmit="saveConfig(event)">
-                <div class="config-section">
-                    <h3>Horário de Irrigação</h3>
-                    <div class="form-group">
-                        <label>Hora:</label>
-                        <input type="number" id="horaInicio" name="horaInicio" min="0" max="23">
-                    </div>
-                    <div class="form-group">
-                        <label>Minuto:</label>
-                        <input type="number" id="minutoInicio" name="minutoInicio" min="0" max="59">
-                    </div>
-                </div>
-
-                <div class="config-section">
-                    <h3>Configurações MQTT (Opcional)</h3>
-                    <div class="form-group">
-                        <label>Servidor:</label>
-                        <input type="text" id="mqtt_server" name="mqtt_server">
-                    </div>
-                    <div class="form-group">
-                        <label>Porta:</label>
-                        <input type="text" id="mqtt_port" name="mqtt_port">
-                    </div>
-                    <div class="form-group">
-                        <label>Usuário:</label>
-                        <input type="text" id="mqtt_user" name="mqtt_user">
-                    </div>
-                    <div class="form-group">
-                        <label>Senha:</label>
-                        <input type="password" id="mqtt_password" name="mqtt_password">
-                    </div>
-                </div>
-                
-                <div class="form-group">
-                    <button type="submit">Salvar</button>
-                </div>
-            </form>
-        </div>
-
-        <div id="Info" class="tabcontent">
-            <div class="grid">
-                <div class="card">
-                    <h3>Hora do Sistema</h3>
-                    <div id="system-time" class="value-display">--:--:--</div>
-                </div>
-                <div class="card">
-                    <h3>Rede WiFi</h3>
-                    <div id="wifi-name" class="value-display">--</div>
-                </div>
-                <div class="card">
-                    <h3>Força do Sinal</h3>
-                    <div id="wifi-strength" class="value-display">-- dBm</div>
-                </div>
-                <div class="card">
-                    <h3>Endereço IP</h3>
-                    <div id="ip-address" class="value-display">--</div>
-                </div>
-                <div class="card">
-                    <h3>Temperatura ESP32</h3>
-                    <div id="esp-temp" class="value-display">--°C</div>
-                </div>
-                <div class="card">
-                    <h3>Memória Livre</h3>
-                    <div id="free-memory" class="value-display">--%</div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-
-                function loadConfig() {
-            fetch('/getConfig')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('horaInicio').value = data.horaInicio;
-                    document.getElementById('minutoInicio').value = data.minutoInicio;
-                    document.getElementById('mqtt_server').value = data.mqtt_server;
-                    document.getElementById('mqtt_port').value = data.mqtt_port;
-                    document.getElementById('mqtt_user').value = data.mqtt_user;
-                    document.getElementById('mqtt_password').value = data.mqtt_password;
-                });
-        }
-
- function openTab(evt, tabName) {
-            var i, tabcontent, tablinks;
-            tabcontent = document.getElementsByClassName("tabcontent");
-            for (i = 0; i < tabcontent.length; i++) {
-                tabcontent[i].style.display = "none";
-            }
-            tablinks = document.getElementsByClassName("tablinks");
-            for (i = 0; i < tablinks.length; i++) {
-                tablinks[i].className = tablinks[i].className.replace(" active", "");
-            }
-            document.getElementById(tabName).style.display = "block";
-            evt.currentTarget.className += " active";
-            
-            if (tabName === 'Config') {
-                loadConfig();
-            }
-        }
-
-        document.getElementById("defaultOpen").click();
-
-        function updateSensorData() {
-            fetch('/sensorData')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('temperatura').textContent = data.temperatura + '°C';
-                    document.getElementById('umidade').textContent = data.umidade + '%';
-                    document.getElementById('umidadeSolo').textContent = data.umidadeSolo + '%';
-                    document.getElementById('modoAutomatico').checked = data.modoAutomatico;
-                    document.getElementById('releStatus').checked = data.releStatus;
-                });
-        }
-
-        function toggleModo() {
-            const modo = document.getElementById('modoAutomatico').checked;
-            fetch('/toggleModo', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({modo: modo})
-            });
-        }
-
-        function toggleRele() {
-            const status = document.getElementById('releStatus').checked;
-            fetch('/toggleRele', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({status: status})
-            });
-        }
-
-          function saveConfig(event) {
-            event.preventDefault();
-            const formData = new FormData(event.target);
-            const data = Object.fromEntries(formData.entries());
-            
-            fetch('/saveConfig', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(result => {
-                if (result.success) {
-                    alert('Configurações salvas com sucesso!');
-                } else {
-                    alert('Erro ao salvar configurações: ' + result.message);
-                }
-            })
-            .catch(error => {
-                alert('Erro ao salvar configurações: ' + error);
-            });
-        }
-
-         // Adicione esta função
-        function updateSystemInfo() {
-            fetch('/systemInfo')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('system-time').textContent = data.hora;
-                    document.getElementById('wifi-name').textContent = data.wifi_ssid;
-                    document.getElementById('wifi-strength').textContent = data.wifi_strength + ' dBm';
-                    document.getElementById('ip-address').textContent = data.ip;
-                    document.getElementById('esp-temp').textContent = data.esp_temp.toFixed(1) + '°C';
-                    document.getElementById('free-memory').textContent = 
-                        data.heap_percent.toFixed(1) + '% (' + 
-                        Math.round(data.heap_free / 1024) + 'KB free)';
-                });
-        }
-
-        // Modifique o setInterval para incluir a atualização das informações do sistema
-        setInterval(() => {
-            updateSensorData();
-            updateSystemInfo();
-        }, 2000);
-    </script>
-</body>
-</html>
-)rawliteral";
-
-void saveConfig() {
-    preferences.begin("config", false);
-    preferences.putString("mqtt_server", config.mqtt_server);
-    preferences.putString("mqtt_port", config.mqtt_port);
-    preferences.putString("mqtt_user", config.mqtt_user);
-    preferences.putString("mqtt_password", config.mqtt_password);
-    preferences.putInt("horaInicio", config.horaInicio);
-    preferences.putInt("minutoInicio", config.minutoInicio);
-    config.modoAutomatico = !config.modoAutomatico;
-    saveConfig();
-    preferences.end();
-}
-
-void loadConfig() {
-    preferences.begin("config", true);
-    strlcpy(config.mqtt_server, preferences.getString("mqtt_server", "").c_str(), sizeof(config.mqtt_server));
-    strlcpy(config.mqtt_port, preferences.getString("mqtt_port", "1883").c_str(), sizeof(config.mqtt_port));
-    strlcpy(config.mqtt_user, preferences.getString("mqtt_user", "").c_str(), sizeof(config.mqtt_user));
-    strlcpy(config.mqtt_password, preferences.getString("mqtt_password", "").c_str(), sizeof(config.mqtt_password));
-    config.horaInicio = preferences.getInt("horaInicio", 5);
-    config.minutoInicio = preferences.getInt("minutoInicio", 0);
-    config.modoAutomatico = preferences.getBool("modoAuto", true);
-    preferences.end();
-}
-
-
-// Funções auxiliares
-void lerSensores() {
-  state.temperatura = dht.readTemperature();
-  state.umidade = dht.readHumidity();
-
-  float soloRawTotal = 0;
-  int sensoresValidos = 0;
-  const int SOIL_SENSOR_PINS[NUM_SOIL_SENSORS] = { SOIL_SENSOR1, SOIL_SENSOR2 };
-
-  for (int i = 0; i < NUM_SOIL_SENSORS; i++) {
-    int soloRaw = analogRead(SOIL_SENSOR_PINS[i]);
-    if (soloRaw >= 0 && soloRaw <= 4095) {
-      float soloPercentage = map(soloRaw, 4095, 0, 0, 100);
-      soloRawTotal += soloPercentage;
-      sensoresValidos++;
-    }
-  }
-
-  state.umidadeSolo = (sensoresValidos > 0) ? (soloRawTotal / sensoresValidos) : 0;
-}
-
-void controleRele(bool status) {
-  state.relayStatus = status;
-  digitalWrite(RELAY_PIN, status);
-  if (status) {
-    state.tempoIrrigacaoInicio = millis();
-  }
-
-  // Publica estado no MQTT se conectado
-  if (mqttClient.connected()) {
-    mqttClient.publish("irrigation/relay/state", status ? "ON" : "OFF");
+// Funções de controle do sistema
+void piscarLed(int pin, int vezes, int duracaoPisca) {
+  for (int i = 0; i < vezes; i++) {
+    digitalWrite(pin, HIGH);
+    delay(duracaoPisca);
+    digitalWrite(pin, LOW);
+    delay(duracaoPisca);
   }
 }
 
-void verificarAgendamento() {
-  if (!config.modoAutomatico) return;
+void atualizarLedRede() {
+  switch (estadoLedRede) {
+    case LED_OK:
+      digitalWrite(LED_REDE_PIN, HIGH);
+      break;
+    case LED_ERRO_WIFI:
+      piscarLed(LED_REDE_PIN, 2, 100);
+      break;
+    case LED_ERRO_SENSOR:
+      piscarLed(LED_REDE_PIN, 3, 100);
+      break;
+    case LED_CONFIGURANDO:
+      piscarLed(LED_REDE_PIN, 1, 500);
+      break;
+  }
+}
 
+void atualizarLedRele() {
+  if (releAtivo) {
+    digitalWrite(LED_RELE_PIN, HIGH);
+  } else {
+    digitalWrite(LED_RELE_PIN, LOW);
+  }
+}
+
+void ligarRele() {
+  digitalWrite(RELE_PIN, LOW);  // Lógica invertida - LOW liga
+  releAtivo = true;
+  tempoInicioIrrigacao = millis();
+  atualizarLedRele();
+}
+
+void desligarRele() {
+  digitalWrite(RELE_PIN, HIGH); // Lógica invertida - HIGH desliga
+  releAtivo = false;
+  atualizarLedRele();
+}
+
+int lerUmidadeSolo() {
+  int leitura1 = analogRead(SOLO_PIN1);
+  int leitura2 = analogRead(SOLO_PIN2);
+  
+  // Média das leituras
+  int mediaLeitura = (leitura1 + leitura2) / 2;
+  
+  // Mapear a leitura para um percentual (invertido, pois o sensor é capacitivo)
+  int umidadePercentual = map(mediaLeitura, LEITURA_SOLO_MAX, LEITURA_SOLO_MIN, SOLO_MINIMO, SOLO_MAXIMO);
+  
+  // Limitar entre 0% e 100%
+  umidadePercentual = constrain(umidadePercentual, SOLO_MINIMO, SOLO_MAXIMO);
+  
+  return umidadePercentual;
+}
+
+bool verificarHorarioIrrigacao() {
   timeClient.update();
   int horaAtual = timeClient.getHours();
   int minutoAtual = timeClient.getMinutes();
-
-  if (horaAtual == config.horaInicio && minutoAtual == config.minutoInicio) {
-    if (!state.relayStatus) {
-      controleRele(true);
-    }
-  }
-
-  // Verifica tempo máximo de irrigação
-  if (state.relayStatus && ((millis() - state.tempoIrrigacaoInicio >= DURACAO_MAXIMA_IRRIGACAO) || (state.umidadeSolo >= 80))) {
-    controleRele(false);
-  }
+  
+  return (horaAtual == horaInicio && minutoAtual == minutoInicio);
 }
 
-void checkWiFiConnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi desconectado. Reconectando...");
-    WiFi.reconnect();
-  }
+void carregarConfiguracoes() {
+  preferences.begin("irrigacao", false);
+  horaInicio = preferences.getInt("horaInicio", 6);
+  minutoInicio = preferences.getInt("minutoInicio", 0);
+  modoAutomatico = preferences.getBool("modoAuto", true);
+  preferences.end();
 }
 
-// Callbacks MQTT
-void callback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-
-  if (String(topic) == "irrigation/relay/set") {
-    if (!config.modoAutomatico) {
-      controleRele(message == "ON");
-    }
-  } else if (String(topic) == "irrigation/mode/set") {
-    config.modoAutomatico = (message == "AUTO");
-    preferences.begin("config", false);
-    config.modoAutomatico = !config.modoAutomatico;
-    saveConfig();
-    preferences.end();
-  }
+void salvarConfiguracoes() {
+  preferences.begin("irrigacao", false);
+  preferences.putInt("horaInicio", horaInicio);
+  preferences.putInt("minutoInicio", minutoInicio);
+  preferences.putBool("modoAuto", modoAutomatico);
+  preferences.end();
 }
 
-void reconnectMQTT() {
-  if (!mqttClient.connected() && (millis() - state.lastMqttRetry >= MQTT_RETRY_INTERVAL)) {
-
-    state.lastMqttRetry = millis();
-
-    if (mqttClient.connect("ESP32_Irrigation",
-                           config.mqtt_user,
-                           config.mqtt_password)) {
-
-      mqttClient.subscribe("irrigation/relay/set");
-      mqttClient.subscribe("irrigation/mode/set");
-    }
-  }
-}
-
-// Handlers do servidor web
+// Handlers para o servidor web
 void handleRoot() {
-  server.send(200, "text/html", htmlPage);
-}
-
-void handleSensorData() {
-  StaticJsonDocument<200> doc;
-  doc["temperatura"] = state.temperatura;
-  doc["umidade"] = state.umidade;
-  doc["umidadeSolo"] = state.umidadeSolo;
-  doc["modoAutomatico"] = config.modoAutomatico;
-  doc["releStatus"] = state.relayStatus;
-
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
-}
-
-void handleToggleModo() {
-  if (server.hasArg("plain")) {
-    StaticJsonDocument<200> doc;
-    deserializeJson(doc, server.arg("plain"));
-    config.modoAutomatico = doc["modo"].as<bool>();
-
-    preferences.begin("config", false);
-    config.modoAutomatico = !config.modoAutomatico;
-    saveConfig();
-    preferences.end();
-
-    server.send(200, "text/plain", "OK");
+  File file = SPIFFS.open("/index.html", "r");
+  if (file) {
+    server.streamFile(file, "text/html");
+    file.close();
+  } else {
+    server.send(404, "text/plain", "Arquivo não encontrado");
   }
 }
 
-void handleToggleRele() {
-  if (server.hasArg("plain")) {
-    StaticJsonDocument<200> doc;
-    deserializeJson(doc, server.arg("plain"));
+void handleCSS() {
+  File file = SPIFFS.open("/style.css", "r");
+  if (file) {
+    server.streamFile(file, "text/css");
+    file.close();
+  } else {
+    server.send(404, "text/plain", "Arquivo não encontrado");
+  }
+}
 
-    if (!config.modoAutomatico) {
-      controleRele(doc["status"].as<bool>());
+void handleJS() {
+  File file = SPIFFS.open("/script.js", "r");
+  if (file) {
+    server.streamFile(file, "application/javascript");
+    file.close();
+  } else {
+    server.send(404, "text/plain", "Arquivo não encontrado");
+  }
+}
+
+void handleDados() {
+  float temperatura = dht.readTemperature();
+  float umidade = dht.readHumidity();
+  int umidadeSolo = lerUmidadeSolo();
+  
+  String json = "{";
+  json += "\"temperatura\":" + String(isnan(temperatura) ? 0 : temperatura) + ",";
+  json += "\"umidade\":" + String(isnan(umidade) ? 0 : umidade) + ",";
+  json += "\"umidadeSolo\":" + String(umidadeSolo) + ",";
+  json += "\"releAtivo\":" + String(releAtivo ? "true" : "false") + ",";
+  json += "\"modoAutomatico\":" + String(modoAutomatico ? "true" : "false") + ",";
+  json += "\"horaInicio\":" + String(horaInicio) + ",";
+  json += "\"minutoInicio\":" + String(minutoInicio);
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleControle() {
+  // Controle do relé no modo manual
+  if (server.hasArg("releManual")) {
+    if (!modoAutomatico) {
+      String acao = server.arg("releManual");
+      if (acao == "ligar") {
+        ligarRele();
+      } else if (acao == "desligar") {
+        desligarRele();
+      }
     }
-
-    server.send(200, "text/plain", "OK");
   }
-}
-
-void handleSaveConfig() {
-  if (server.hasArg("plain")) {
-    StaticJsonDocument<512> doc;
-    deserializeJson(doc, server.arg("plain"));
-
-    preferences.begin("config", false);
-
-    // Salva configurações MQTT
-    strlcpy(config.mqtt_server, doc["mqtt_server"] | "", sizeof(config.mqtt_server));
-    strlcpy(config.mqtt_port, doc["mqtt_port"] | "1883", sizeof(config.mqtt_port));
-    strlcpy(config.mqtt_user, doc["mqtt_user"] | "", sizeof(config.mqtt_user));
-    strlcpy(config.mqtt_password, doc["mqtt_password"] | "", sizeof(config.mqtt_password));
-
-    // Salva configurações de horário
-    config.horaInicio = doc["horaInicio"] | 5;
-    config.minutoInicio = doc["minutoInicio"] | 0;
-
-    // Salva na memória
-    preferences.putString("mqtt_server", config.mqtt_server);
-    preferences.putString("mqtt_port", config.mqtt_port);
-    preferences.putString("mqtt_user", config.mqtt_user);
-    preferences.putString("mqtt_password", config.mqtt_password);
-    preferences.putInt("horaInicio", config.horaInicio);
-    preferences.putInt("minutoInicio", config.minutoInicio);
-
-    preferences.end();
-
-    // Reconecta MQTT com as novas configurações
-    if (strlen(config.mqtt_server) > 0) {
-      mqttClient.setServer(config.mqtt_server, atoi(config.mqtt_port));
-    }
-
-    server.send(200, "text/plain", "Configurações salvas com sucesso!");
+  
+  // Alteração do modo
+  if (server.hasArg("modo")) {
+    String modo = server.arg("modo");
+    modoAutomatico = (modo == "automatico");
+    salvarConfiguracoes();
   }
-}
-
-
-
-void handleSystemInfo() {
-  StaticJsonDocument<512> doc;
-
-  // Informações de tempo
-  timeClient.update();
-  doc["hora"] = timeClient.getFormattedTime();
-
-  // Informações de WiFi
-  doc["wifi_ssid"] = WiFi.SSID();
-  doc["wifi_strength"] = WiFi.RSSI();
-  doc["ip"] = WiFi.localIP().toString();
-
-  // Informações do sistema
-  doc["esp_temp"] = getESPTemp();
-  doc["heap_total"] = ESP.getHeapSize();
-  doc["heap_free"] = ESP.getFreeHeap();
-  doc["heap_percent"] = (ESP.getFreeHeap() * 100.0) / ESP.getHeapSize();
-
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
-}
-
-void publicarDadosMQTT() {
-  if (!mqttClient.connected()) return;
-
-  StaticJsonDocument<200> doc;
-  doc["temperatura"] = state.temperatura;
-  doc["umidade"] = state.umidade;
-  doc["umidadeSolo"] = state.umidadeSolo;
-  doc["modoAutomatico"] = config.modoAutomatico;
-  doc["releStatus"] = state.relayStatus;
-
-  String payload;
-  serializeJson(doc, payload);
-  mqttClient.publish("irrigation/status", payload.c_str());
+  
+  // Configuração do horário
+  if (server.hasArg("horaInicio") && server.hasArg("minutoInicio")) {
+    horaInicio = server.arg("horaInicio").toInt();
+    minutoInicio = server.arg("minutoInicio").toInt();
+    salvarConfiguracoes();
+  }
+  
+  server.send(200, "text/plain", "OK");
 }
 
 void setup() {
-    loadConfig();
+  // Iniciando Serial
   Serial.begin(115200);
-
-  // Configuração dos pins
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(BTN_MODE, INPUT_PULLUP);
-
-  // Inicializa sensores
+  
+  // Configurando os pinos
+  pinMode(RELE_PIN, OUTPUT);
+  pinMode(BOTAO_PIN, INPUT_PULLUP);
+  pinMode(LED_REDE_PIN, OUTPUT);
+  pinMode(LED_RELE_PIN, OUTPUT);
+  
+  // Desliga o relé inicialmente (lógica invertida)
+  desligarRele();
+  
+  // Inicia o sensor DHT
   dht.begin();
+  
+  // Inicia o sistema de arquivos SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Erro ao montar SPIFFS");
+    estadoLedRede = LED_ERRO_SENSOR;
+    return;
+  }
+  
+  // Carregar configurações salvas
+  carregarConfiguracoes();
+  
+  // Conectar ao Wi-Fi
+  WiFi.begin(ssid, password);
+  
+  // Espera pela conexão
+  unsigned long inicioConexao = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    
+    // Timeout de 20 segundos
+    if (millis() - inicioConexao > 20000) {
+      Serial.println("Falha ao conectar ao Wi-Fi");
+      estadoLedRede = LED_ERRO_WIFI;
+      break;
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.print("Conectado ao WiFi. IP: ");
+    Serial.println(WiFi.localIP());
+    estadoLedRede = LED_OK;
+    
+    // Inicia o cliente NTP
+    timeClient.begin();
+    
+    // Define rotas para a interface web
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/style.css", HTTP_GET, handleCSS);
+    server.on("/script.js", HTTP_GET, handleJS);
+    server.on("/dados", HTTP_GET, handleDados);
+    server.on("/controle", HTTP_POST, handleControle);
+    
+    // Iniciar servidor web
+    server.begin();
+  }
+  
+  // Cria os arquivos necessários no SPIFFS
+  criarArquivosWeb();
+}
 
-  // Carrega configurações salvas
-  preferences.begin("config", true);
-  strlcpy(config.mqtt_server, preferences.getString("mqtt_server", "").c_str(), sizeof(config.mqtt_server));
-  strlcpy(config.mqtt_port, preferences.getString("mqtt_port", "1883").c_str(), sizeof(config.mqtt_port));
-  strlcpy(config.mqtt_user, preferences.getString("mqtt_user", "").c_str(), sizeof(config.mqtt_user));
-  strlcpy(config.mqtt_password, preferences.getString("mqtt_password", "").c_str(), sizeof(config.mqtt_password));
-
-  config.horaInicio = preferences.getInt("horaInicio", 5);
-  config.minutoInicio = preferences.getInt("minutoInicio", 0);
-  config.modoAutomatico = preferences.getBool("modoAuto", true);
-  preferences.end();
-
-  // Configuração WiFi
-  WiFi.mode(WIFI_STA);
-  wm.autoConnect("ESP_IRRIGATION_AP", "password123");
-
-  // Configuração MQTT
-  if (strlen(config.mqtt_server) > 0) {
-    mqttClient.setServer(config.mqtt_server, atoi(config.mqtt_port));
-    mqttClient.setCallback(callback);
+void criarArquivosWeb() {
+  if (!SPIFFS.exists("/index.html")) {
+    File file = SPIFFS.open("/index.html", "w");
+    if (file) {
+      file.print(R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistema de Irrigação Inteligente</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Sistema de Irrigação Inteligente</h1>
+        </header>
+        
+        <div class="sensores">
+            <div class="sensor">
+                <h2>Temperatura</h2>
+                <p id="temperatura">--</p>
+                <span class="unidade">°C</span>
+            </div>
+            <div class="sensor">
+                <h2>Umidade do Ar</h2>
+                <p id="umidade">--</p>
+                <span class="unidade">%</span>
+            </div>
+        </div>
+        
+        <div class="solo">
+            <h2>Umidade do Solo</h2>
+            <div class="medidor">
+                <div id="barra-solo" class="barra"></div>
+            </div>
+            <p id="umidade-solo">--</p>
+            <span class="unidade">%</span>
+        </div>
+        
+        <div class="controles">
+            <div class="controle">
+                <h3>Irrigação</h3>
+                <button id="btn-rele" class="btn">Ligar Irrigação</button>
+            </div>
+            <div class="controle">
+                <h3>Modo</h3>
+                <button id="btn-modo" class="btn">Automático</button>
+            </div>
+        </div>
+        
+        <div class="configuracao">
+            <h2>Horário de Irrigação</h2>
+            <div class="form-group">
+                <label for="hora">Hora:</label>
+                <select id="hora"></select>
+                
+                <label for="minuto">Minuto:</label>
+                <select id="minuto"></select>
+                
+                <button id="btn-salvar" class="btn">Salvar</button>
+            </div>
+        </div>
+        
+        <div class="status">
+            <div id="status-modo" class="status-item">
+                <span class="status-label">Modo:</span>
+                <span id="modo-valor">Automático</span>
+            </div>
+            <div id="status-rele" class="status-item">
+                <span class="status-label">Irrigação:</span>
+                <span id="rele-valor">Desligada</span>
+            </div>
+        </div>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
+)rawliteral");
+      file.close();
+    }
   }
 
-  // Configuração do servidor web
-  server.on("/", handleRoot);
-  server.on("/systemInfo", handleSystemInfo);
-  server.on("/sensorData", handleSensorData);
-  server.on("/toggleModo", HTTP_POST, handleToggleModo);
-  server.on("/toggleRele", HTTP_POST, handleToggleRele);
-  server.on("/saveConfig", HTTP_POST, handleSaveConfig);
-  server.begin();
+  if (!SPIFFS.exists("/style.css")) {
+    File file = SPIFFS.open("/style.css", "w");
+    if (file) {
+      file.print(R"rawliteral(
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: 'Arial', sans-serif;
+}
 
-  // Inicializa NTP
-  timeClient.begin();
-  timeClient.update();
+body {
+    background-color: #f5f5f5;
+    color: #333;
+}
 
-  // Configuração mDNS
-  if (!MDNS.begin("irrigation")) {
-    Serial.println("Erro ao iniciar mDNS");
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+header {
+    background-color: #2c3e50;
+    color: white;
+    padding: 15px;
+    text-align: center;
+    border-radius: 8px;
+    margin-bottom: 20px;
+}
+
+.sensores {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 20px;
+}
+
+.sensor {
+    background-color: white;
+    border-radius: 8px;
+    padding: 15px;
+    text-align: center;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.sensor h2 {
+    margin-bottom: 10px;
+    font-size: 1.2em;
+    color: #2c3e50;
+}
+
+.sensor p {
+    font-size: 2em;
+    font-weight: bold;
+    color: #3498db;
+}
+
+.solo {
+    background-color: white;
+    border-radius: 8px;
+    padding: 15px;
+    text-align: center;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.solo h2 {
+    margin-bottom: 10px;
+    font-size: 1.2em;
+    color: #2c3e50;
+}
+
+.medidor {
+    background-color: #ecf0f1;
+    height: 20px;
+    border-radius: 10px;
+    margin-bottom: 10px;
+    overflow: hidden;
+}
+
+.barra {
+    height: 100%;
+    width: 0%;
+    background-color: #27ae60;
+    transition: width 0.5s ease;
+}
+
+.controles {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 20px;
+}
+
+.controle {
+    background-color: white;
+    border-radius: 8px;
+    padding: 15px;
+    text-align: center;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.controle h3 {
+    margin-bottom: 10px;
+    color: #2c3e50;
+}
+
+.btn {
+    background-color: #3498db;
+    color: white;
+    border: none;
+    padding: 10px 15px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: bold;
+    transition: background-color 0.3s;
+}
+
+.btn:hover {
+    background-color: #2980b9;
+}
+
+.configuracao {
+    background-color: white;
+    border-radius: 8px;
+    padding: 15px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.configuracao h2 {
+    margin-bottom: 15px;
+    font-size: 1.2em;
+    color: #2c3e50;
+    text-align: center;
+}
+
+.form-group {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+}
+
+.form-group label {
+    font-weight: bold;
+}
+
+.form-group select {
+    padding: 8px;
+    border-radius: 5px;
+    border: 1px solid #ddd;
+}
+
+.status {
+    background-color: white;
+    border-radius: 8px;
+    padding: 15px;
+    display: flex;
+    justify-content: space-around;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.status-item {
+    text-align: center;
+}
+
+.status-label {
+    font-weight: bold;
+    margin-right: 5px;
+}
+
+/* Estilos especiais para botões */
+#btn-rele.ativo {
+    background-color: #e74c3c;
+}
+
+#btn-modo.manual {
+    background-color: #f39c12;
+}
+
+/* Estilos para dispositivos móveis */
+@media (max-width: 600px) {
+    .sensores, .controles {
+        grid-template-columns: 1fr;
+    }
+
+    .form-group {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .status {
+        flex-direction: column;
+        gap: 10px;
+    }
+}
+
+.unidade {
+    font-size: 0.8em;
+    color: #7f8c8d;
+}
+
+#umidade-solo {
+    font-size: 2em;
+    font-weight: bold;
+    color: #27ae60;
+    display: inline-block;
+}
+)rawliteral");
+      file.close();
+    }
+  }
+
+  if (!SPIFFS.exists("/script.js")) {
+    File file = SPIFFS.open("/script.js", "w");
+    if (file) {
+      file.print(R"rawliteral(
+document.addEventListener('DOMContentLoaded', function() {
+    // Elementos da interface
+    const temperaturaEl = document.getElementById('temperatura');
+    const umidadeEl = document.getElementById('umidade');
+    const umidadeSoloEl = document.getElementById('umidade-solo');
+    const barraSoloEl = document.getElementById('barra-solo');
+    const btnReleEl = document.getElementById('btn-rele');
+    const btnModoEl = document.getElementById('btn-modo');
+    const horaEl = document.getElementById('hora');
+    const minutoEl = document.getElementById('minuto');
+    const btnSalvarEl = document.getElementById('btn-salvar');
+    const modoValorEl = document.getElementById('modo-valor');
+    const releValorEl = document.getElementById('rele-valor');
+    
+    // Preencher as opções de hora e minuto
+    for (let i = 0; i < 24; i++) {
+        const option = document.createElement('option');
+        option.value = i;
+        option.text = i.toString().padStart(2, '0');
+        horaEl.appendChild(option);
+    }
+    
+    for (let i = 0; i < 60; i++) {
+        const option = document.createElement('option');
+        option.value = i;
+        option.text = i.toString().padStart(2, '0');
+        minutoEl.appendChild(option);
+    }
+    
+    // Estado local
+    let modoAutomatico = true;
+    let releAtivo = false;
+    
+    // Função para atualizar dados
+    function atualizarDados() {
+        fetch('/dados')
+            .then(response => response.json())
+            .then(data => {
+                temperaturaEl.textContent = data.temperatura.toFixed(1);
+                umidadeEl.textContent = data.umidade.toFixed(1);
+                umidadeSoloEl.textContent = data.umidadeSolo;
+                barraSoloEl.style.width = `${data.umidadeSolo}%`;
+                
+                // Atualiza estado do relé
+                releAtivo = data.releAtivo;
+                if (releAtivo) {
+                    btnReleEl.textContent = 'Desligar Irrigação';
+                    btnReleEl.classList.add('ativo');
+                    releValorEl.textContent = 'Ligada';
+                } else {
+                    btnReleEl.textContent = 'Ligar Irrigação';
+                    btnReleEl.classList.remove('ativo');
+                    releValorEl.textContent = 'Desligada';
+                }
+                
+                // Atualiza modo
+                modoAutomatico = data.modoAutomatico;
+                if (modoAutomatico) {
+                    btnModoEl.textContent = 'Automático';
+                    btnModoEl.classList.remove('manual');
+                    modoValorEl.textContent = 'Automático';
+                } else {
+                    btnModoEl.textContent = 'Manual';
+                    btnModoEl.classList.add('manual');
+                    modoValorEl.textContent = 'Manual';
+                }
+                
+                // Atualiza formulário de horário
+                horaEl.value = data.horaInicio;
+                minutoEl.value = data.minutoInicio;
+                
+                // Atualiza cor da barra de acordo com o nível
+                if (data.umidadeSolo < 30) {
+                    barraSoloEl.style.backgroundColor = '#e74c3c'; // Vermelho - seco
+                } else if (data.umidadeSolo < 70) {
+                    barraSoloEl.style.backgroundColor = '#f39c12'; // Laranja - médio
+                } else {
+                    barraSoloEl.style.backgroundColor = '#27ae60'; // Verde - úmido
+                }
+            })
+            .catch(error => console.error('Erro ao obter dados:', error));
+    }
+    
+    // Eventos de botões
+    btnReleEl.addEventListener('click', function() {
+        if (modoAutomatico) {
+            alert('Desative o modo automático para controlar manualmente.');
+            return;
+        }
+        
+        const acao = releAtivo ? 'desligar' : 'ligar';
+        
+        fetch('/controle', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `releManual=${acao}`
+        })
+        .then(response => {
+            if (response.ok) {
+                // Atualiza imediatamente para feedback visual rápido
+                releAtivo = !releAtivo;
+                if (releAtivo) {
+                    btnReleEl.textContent = 'Desligar Irrigação';
+                    btnReleEl.classList.add('ativo');
+                    releValorEl.textContent = 'Ligada';
+                } else {
+                    btnReleEl.textContent = 'Ligar Irrigação';
+                    btnReleEl.classList.remove('ativo');
+                    releValorEl.textContent = 'Desligada';
+                }
+                setTimeout(atualizarDados, 500); // Atualiza dados após breve pausa
+            }
+        })
+        .catch(error => console.error('Erro ao controlar relé:', error));
+    });
+    
+    btnModoEl.addEventListener('click', function() {
+        const novoModo = modoAutomatico ? 'manual' : 'automatico';
+        
+        fetch('/controle', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `modo=${novoModo}`
+        })
+        .then(response => {
+            if (response.ok) {
+                // Atualiza imediatamente para feedback visual rápido
+                modoAutomatico = !modoAutomatico;
+                if (modoAutomatico) {
+                    btnModoEl.textContent = 'Automático';
+                    btnModoEl.classList.remove('manual');
+                    modoValorEl.textContent = 'Automático';
+                } else {
+                    btnModoEl.textContent = 'Manual';
+                    btnModoEl.classList.add('manual');
+                    modoValorEl.textContent = 'Manual';
+                }
+                setTimeout(atualizarDados, 500); // Atualiza dados após breve pausa
+            }
+        })
+        .catch(error => console.error('Erro ao alterar modo:', error));
+    });
+    
+    btnSalvarEl.addEventListener('click', function() {
+        const hora = horaEl.value;
+        const minuto = minutoEl.value;
+        
+        fetch('/controle', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `horaInicio=${hora}&minutoInicio=${minuto}`
+        })
+        .then(response => {
+            if (response.ok) {
+                alert('Horário de irrigação atualizado com sucesso!');
+                setTimeout(atualizarDados, 500); // Atualiza dados após breve pausa
+            }
+        })
+        .catch(error => console.error('Erro ao salvar horário:', error));
+    });
+    
+    // Atualizar dados a cada 2 segundos
+    atualizarDados();
+    setInterval(atualizarDados, 2000);
+});
+)rawliteral");
+      file.close();
+    }
+  }
+}
+
+void verificarBotao() {
+  static unsigned long ultimaPressao = 0;
+  static bool ultimoEstadoBotao = HIGH; // Pullup, botão não pressionado = HIGH
+  
+  bool estadoAtual = digitalRead(BOTAO_PIN);
+  
+  // Debounce e detecção de borda
+  if (estadoAtual != ultimoEstadoBotao && millis() - ultimaPressao > 50) {
+    ultimaPressao = millis();
+    
+    // Botão foi pressionado (LOW devido ao pullup)
+    if (estadoAtual == LOW) {
+      if (!modoAutomatico) {
+        // Alternar estado do relé no modo manual
+        if (releAtivo) {
+          desligarRele();
+        } else {
+          ligarRele();
+        }
+      } else {
+        // No modo automático, pressionar o botão por mais tempo muda o modo
+        botaoApertado = true;
+      }
+    } else {
+      botaoApertado = false;
+    }
+    
+    ultimoEstadoBotao = estadoAtual;
+  }
+  
+  // Se o botão estiver pressionado por mais de 3 segundos, muda o modo
+  static unsigned long inicioPress = 0;
+  if (botaoApertado && digitalRead(BOTAO_PIN) == LOW) {
+    if (inicioPress == 0) {
+      inicioPress = millis();
+    } else if (millis() - inicioPress > 3000) {
+      modoAutomatico = !modoAutomatico;
+      botaoApertado = false;
+      inicioPress = 0;
+      
+      // Piscar LED para confirmar mudança de modo
+      piscarLed(LED_REDE_PIN, modoAutomatico ? 3 : 2, 200);
+      
+      // Salvar a configuração
+      salvarConfiguracoes();
+    }
+  } else {
+    inicioPress = 0;
   }
 }
 
 void loop() {
-  static unsigned long lastSensorRead = 0;
-  static unsigned long lastMqttPublish = 0;
-  unsigned long currentMillis = millis();
-
-  // Processa requisições web
+  // Lidar com clientes HTTP
   server.handleClient();
-
-  // Atualiza MQTT
-  if (mqttClient.connected()) {
-    mqttClient.loop();
-  } else {
-    reconnectMQTT();
-  }
-
-  // Lê sensores a cada 2 segundos
-  if (currentMillis - lastSensorRead >= 2000) {
-    lerSensores();
-    lastSensorRead = currentMillis;
-  }
-
-  // Publica dados MQTT a cada 5 segundos
-  if (currentMillis - lastMqttPublish >= 5000) {
-    publicarDadosMQTT();
-    lastMqttPublish = currentMillis;
-  }
-
-  // Verifica botão físico
-  if (digitalRead(BTN_MODE) == LOW && !config.modoAutomatico) {
-    delay(50);  // Debounce
-    if (digitalRead(BTN_MODE) == LOW) {
-      controleRele(!state.relayStatus);
-      while (digitalRead(BTN_MODE) == LOW)
-        ;  // Aguarda soltar o botão
+  
+  // Atualizar estado do LED de rede
+  atualizarLedRede();
+  
+  // Verificar botão físico
+  verificarBotao();
+  
+  // Lógica do sistema de irrigação
+  if (modoAutomatico) {
+    // Verificar se é hora de iniciar a irrigação
+    if (!releAtivo && verificarHorarioIrrigacao()) {
+      ligarRele();
+    }
+    
+    // Verificar condições para desligar a irrigação
+    if (releAtivo) {
+      // Verifica se o solo está suficientemente úmido
+      if (lerUmidadeSolo() >= SOLO_MAXIMO) {
+        desligarRele();
+      }
+      
+      // Verifica se o tempo máximo de irrigação foi atingido
+      if (millis() - tempoInicioIrrigacao > TEMPO_IRRIGACAO) {
+        desligarRele();
+      }
     }
   }
-
-  // Verifica agendamento
-  verificarAgendamento();
-
-  checkWiFiConnection();
-
-  // Yield para o ESP
-  yield();
+  
+  // Pequena pausa para estabilidade
+  delay(100);
 }
